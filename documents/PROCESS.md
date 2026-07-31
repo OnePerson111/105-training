@@ -141,6 +141,128 @@ snapshot 只是忠實把畫面唸出來。頁面顯示 `NT$ 4,482.00`，agent �
 
 ---
 
+練習 1 — ✅ 完成（自己造一個 OrderHub MCP Server，提供 3 個唯讀工具）
+
+成品：`src/OrderHub.Mcp`，透過 stdio 提供 `get_order`、`low_stock`、`customer_orders`。
+（方法名 SDK 會自動轉 snake_case：`GetOrder` → `get_order`，所以 agent 看到的不是我寫的 PascalCase。）
+
+#### 1a 有兩個沒發現的洞
+
+`dotnet new console` + `dotnet add reference` 跑完後看起來沒事，但實際上：
+
+| 問題 | 症狀 | 處理 |
+|---|---|---|
+| `ProjectReference` 沒進 csproj | `Program.cs` 引用 `OrderHub.Core.*` 會編不過 | 手動補兩個 `ProjectReference` |
+| TFM 是 `net10.0` | 其餘專案全是 `net8.0`（CLAUDE.md 也寫 .NET 8） | 目前保留 net10.0——能 build（net10 可以參照 net8），但不一致 |
+
+教訓：**指令跑完不代表結果正確，要打開 csproj 看一眼。**
+
+#### 我對文件範本做的兩處調整
+
+1. `LowStock` 改呼叫現成的 `IProductRepository.GetLowStockActiveAsync(threshold)`，
+   不是範本的「拉全部商品 → 記憶體 `Where(StockQuantity < threshold)`」。
+   語意一樣，但篩選在 SQL 完成，也**不用在工具裡重寫一份門檻規則**。
+2. 加 `threshold < 1` 防呆，回文字訊息（對齊練習 3 那條「輸入錯誤不能變成 500」）。
+
+#### build 過 ≠ 能跑，所以我打了真的 JSON-RPC
+
+`OrderHubTools` 只有在工具**被呼叫時**才被 DI 容器建出來，`dotnet build` 驗不到這件事。
+所以我直接對 stdio 發 `initialize` → `tools/list` → `tools/call`：
+
+| 請求 | 結果 |
+|---|---|
+| `tools/list` | 三個工具都列出，description／參數說明如我所寫 |
+| `low_stock(5)` | 5 筆，庫存升冪：SKU-1048(2)、SKU-1005(3)、SKU-1023(3)、SKU-1032(4)、SKU-1014(4) |
+| `get_order(204)` | Subtotal `4980.00`、DiscountRate `0.10`、Total `4482.00` |
+| `get_order(999999)` | `找不到訂單 999999`——清楚訊息，不是 exception dump |
+
+stderr 零 error／exception。
+
+**兩個交叉驗證**（重點是「不用自己驗自己」）：
+
+- `get_order(204)` 的數字跟練習 0 瀏覽器截圖**一字不差**（4,980 / 10% / 4,482）。
+  同一筆訂單、兩條路徑（Razor 頁面 vs MCP 工具）、同一組數字——如果工具偷寫一份折扣，這裡就會分岔。
+- `low_stock(5)` 那 5 筆的庫存值，跟練習 0 建單頁下拉選項讀到的數字一一吻合。
+
+#### 逐項對照文件的「地雷區」
+
+**地雷 1：stdout 絕對不能印東西** — ✅ 符合
+
+| 檢查 | 結果 |
+|---|---|
+| 工具／`Program.cs` 有 `Console.Write*` | 無 |
+| **Core / Infrastructure 有嗎** | 無——這點要特地查，依賴專案裡任何一行 `Console.WriteLine` 一樣會毀掉協定 |
+| log 導向 | `LogToStandardErrorThreshold = LogLevel.Trace`，全部走 stderr |
+| 實測 | stdout 5 行全部 `JSON.parse` 通過，都是合法 JSON-RPC；`info:` log 全在 stderr |
+
+後半句「**stdin 不能立刻關閉**」我實測踩到了：用 pipe 餵一則 `initialize` 後 EOF，
+stderr 顯示 handler **16ms 就處理完**，但 stdout **完全空的**——回應還沒 flush，server 已經收工。
+改成「stdin 保持開著、讀完回應才 close」就正常。這句警告不是理論。
+
+⚠️ **還沒爆的風險**：練習 3 的 `.mcp.json` 用 `dotnet run`，它的建置訊息會印到 **stdout**，
+正好踩回地雷 1（尤其第一次要建置時）。**如果練習 3 agent 連不上，先查這裡。**
+
+**地雷 2：entity 直接序列化會因循環參照在執行期炸掉** — ✅ 符合
+
+文件只講一個迴圈，實際有**兩個**：
+
+```
+Order.Customer → Customer.Orders → Order      ← 文件說的
+Order.Items    → OrderItem.Order → Order      ← 文件沒提到
+```
+
+我寫了最小重現，用同樣形狀實際炸一次：
+
+```
+A) 直接序列化 entity -> JsonException: A possible object cycle was detected...
+   Path: $.Customer.Orders.Customer.Orders...（堆到深度 64）
+B) 投影匿名物件      -> {"Id":204,"Customer":{"Name":"陳志明"}}
+```
+
+A 那段**編譯完全沒問題**——這就是「編譯過 ≠ 能跑」的具體長相。
+三個工具全部投影成匿名物件，而 `get_order(204)` 是**兩個迴圈都在場**（同時載入 Customer 和 Items）
+仍然正常回傳，所以兩條路都避開了。
+
+**地雷 3：金額別自己算** — ✅ 符合
+
+| 檢查 | 結果 |
+|---|---|
+| 工具裡有折扣數字或算式（`0.1`、`* 0.9`、`/100`） | grep **零命中** |
+| 三個金額來源 | 全部問 service：`CalculateSubtotal` / `GetDiscountRate` / `CalculateTotal` |
+| tier 預設值 | `?? CustomerTier.Standard`，與 `OrdersController.cs:138` 一致 |
+| 交叉驗證 | 4,980 / 0.10 / 4,482 與網頁完全相同（見上） |
+
+誠實註記：`LineTotal = UnitPriceSnapshot * Quantity` 確實是工具裡的算式，
+但 `OrdersController.cs:155` 是一模一樣的一行，屬既有展示層慣例，**且不是折扣規則**（單價×數量沒有版本問題）。
+判斷不算違反；若要更嚴應往 service 收，但那是偏離現有慣例的改動，不該在這個練習順手做。
+
+**地雷區沒寫、但同型的一個問題**：範本的 `LowStock` 記憶體篩選，
+跟地雷 3 是**同一種錯，只是換成庫存規則**——門檻邏輯已有一份，工具再寫一份，
+日後把 `<` 改成 `<=` 就會出現兩種答案。這就是我上面調整它的理由。
+
+#### 我自己的測試腳本也踩了兩個坑
+
+1. **stdin 一 EOF 就收不到回應**（同地雷 1 後半句）。
+2. **回應會亂序**：我原本讀到「最後一個送出的 id」就 break，結果兩則比較慢的
+   （`low_stock`、`get_order(204)`）被丟掉，只收到 id 1、2、5。
+   server 是**並行處理**的，要按「收到幾則」收，不能假設順序。
+
+值得記的一點：**這兩個都是我的測試工具錯了，不是 server 錯了。**
+如果當時直接下結論「工具壞了」，就會跑去改沒問題的程式。
+
+#### 一處要修正我先前的理解
+
+`UnsafeRelaxedJsonEscaping` 只作用在**工具自己回傳的那串 JSON**（`get_order` 的中文是乾淨的）。
+`tools/list` 裡的 description 仍是 `\uXXXX`——那段是 SDK 序列化協定信封，不受這個選項影響。
+所以「中文不被轉義、省 token」只對工具 payload 成立，**不含工具描述**。
+
+#### 驗證方式
+
+- ✅ `dotnet build src/OrderHub.Mcp` 成功（0 errors, 0 warnings）
+- ✅ 一個獨立 commit（訊息說明新增了哪些工具）
+
+---
+
 ## 附錄：值得留下的對話片段
 
 （貼 1–2 段最有代表性的 prompt 與回應**摘要**——不用貼全文，重點是「我怎麼問」和「它怎麼答」。）
