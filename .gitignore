@@ -20,3 +20,6 @@ node_modules/
 
 # Local settings that should not be shared
 *.local.json
+
+# Playwright MCP 的暫存輸出（snapshot yml / 預設截圖），不需要進版控
+.playwright-mcp/
