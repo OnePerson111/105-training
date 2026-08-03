@@ -86,7 +86,7 @@
    （順便驗到 `Create.cshtml` 那段 clone + reindex JS 是好的：submit 後 `Lines[1]` 有正確綁上）
 6. 「送出訂單」→ 302 到 `/Orders/Details/204`，綠色 alert「訂單 #204 建立成功」
 
-**結果頁數字（截圖：`documents/activities/screenshots/activity2-ex0-order-204-details.png`）：**
+**結果頁數字：**
 
 | 項目 | 數字 |
 |---|---|
@@ -260,6 +260,245 @@ A 那段**編譯完全沒問題**——這就是「編譯過 ≠ 能跑」的具
 
 - ✅ `dotnet build src/OrderHub.Mcp` 成功（0 errors, 0 warnings）
 - ✅ 一個獨立 commit（訊息說明新增了哪些工具）
+
+---
+
+練習 2 — ✅ 完成（用 MCP Inspector 手動測工具）
+
+```powershell
+npx @modelcontextprotocol/inspector dotnet run --project src/OrderHub.Mcp
+```
+
+裝的是 Inspector **v2.0.0**，啟動後印出帶 token 的網址（`http://localhost:6274?MCP_INSPECTOR_API_TOKEN=...`）。
+UI 跟文件寫的「Connect → Tools → List Tools」略有不同：v2 是**左側 server 卡片上的開關**連線，
+上方切 `Servers` / `Tools` 分頁；工具列表在連上後自動載入，不用手動按 List Tools。
+
+Inspector 是網頁 UI，所以我讓 agent 用 Playwright MCP 去點——**兩個 MCP 疊在一起用**：
+Playwright 開瀏覽器操作 Inspector，Inspector 再去跟我自己寫的 OrderHub MCP 講話。
+
+#### 驗證方式
+
+- ✅ **三個工具都列得出來，description、參數說明如我所寫**
+  `customer_orders` / `get_order` / `low_stock` 都在。
+  `low_stock` 的說明顯示「列出庫存低於門檻且仍在販售的商品，依庫存量升冪排序」，
+  參數 `threshold` 顯示「庫存門檻，預設 10」，而且**表單預先填了 10**——
+  C# 的 `int threshold = 10` 預設值被 SDK 寫進 schema 了。
+  `get_order` 的 `id` 標成 `id *`（必填、沒有預設），也對。
+
+- ✅ **`low_stock(10)` 回傳的商品和 `/Products/LowStock` 頁面一致**
+  六筆、順序與庫存數字完全相同：
+
+  | # | Inspector `low_stock(10)` | `/Products/LowStock` 頁面 |
+  |---|---|---|
+  | 1 | SKU-1048 晨光 行動電源 2 | SKU-1048 晨光 行動電源 2 |
+  | 2 | SKU-1005 極光 筆電支架 3 | SKU-1005 極光 筆電支架 3 |
+  | 3 | SKU-1023 雲峰 27吋螢幕 3 | SKU-1023 雲峰 27吋螢幕 3 |
+  | 4 | SKU-1032 曜石 機械鍵盤 4 | SKU-1032 曜石 機械鍵盤 4 |
+  | 5 | SKU-1014 星河 USB-C 集線器 4 | SKU-1014 星河 USB-C 集線器 4 |
+  | 6 | SKU-1001 極光 無線滑鼠 5 | SKU-1001 極光 無線滑鼠 5 |
+
+  唯一差異是**欄位**不是資料：頁面多一欄「近 30 天售出」，工具沒吐。
+  那個欄位要走 `IProductService.GetLowStockAsync`（會 join 訂單）；
+  我的工具走 `IProductRepository.GetLowStockActiveAsync`，只到商品層。
+  商品清單一致，但如果哪天 agent 需要「賣得快又快缺貨」的判斷，這欄就得補。
+
+- ✅ **`get_order(999999)` 回清楚訊息，不是 exception dump**
+  回傳 `找不到訂單 999999`，而且 server log 寫 `"get_order" completed. IsError = False.`
+  ——它是一個**正常的文字結果**，不是協定層的錯誤。這是刻意的：
+  查無資料不是「壞掉」，不該讓 agent 收到一坨 stack trace。
+
+#### Inspector 的 Server Console 給了兩個 build／單測拿不到的證據
+
+Inspector 有個 **Server Console** 分頁，專門收 server 的 **stderr**。
+
+**證據一：地雷 1 真的沒踩到。** 從啟動到三次呼叫，所有 `info:` log（Hosting、StdioServerTransport、
+McpServer、EF Core）**全部出現在 Console 分頁**，協定通道一路乾淨，連線正常。
+這比我自己 grep「有沒有 Console.WriteLine」強——這是**執行時**的證明。
+
+**證據二：`low_stock` 的門檻篩選確實在 SQL 裡。** Console 印出 EF 產生的真實 SQL：
+
+```sql
+SELECT ... FROM [Products] AS [p]
+WHERE [p].[IsActive] = CAST(1 AS bit) AND [p].[StockQuantity] < @__threshold_0
+ORDER BY [p].[StockQuantity]
+```
+
+我在練習 1 把範本的「拉全部商品再記憶體篩選」改成呼叫現成的 repository 方法，
+這行 SQL 就是那個改動有生效的**直接證據**（`WHERE` 和 `ORDER BY` 都下到資料庫了）。
+光看程式碼只能說「我改了」，看到這行才能說「它真的這樣跑」。
+
+順帶記下三個耗時：`tools/list` 17ms、`low_stock` 首呼 2,284ms（含 EF 暖機）、`get_order` 246ms。
+
+#### 關於「練習 3 的 `dotnet run` 會踩地雷 1」——這次沒爆，但原因要記清楚
+
+我在練習 1 標了這個風險。實測**連線成功**，原因是：**專案已經 build 過了，所以 `dotnet run` 沒有東西可印到 stdout**。
+但連線花了 **15.3 秒**，那就是 `dotnet run` 的檢查／啟動成本。
+
+所以這個地雷沒有消失，只是這次剛好沒引爆。**第一次跑、或改完程式碼還沒 build 時風險最高**。
+真的出事的話，改用 `dotnet run --no-build`（或直接指向編好的 dll）就能繞開。
+
+#### 為什麼這個練習要排在「接給 agent」之前
+
+Inspector 是**不含模型**的測試通道：我直接對工具送參數、直接看回傳。
+所以工具有問題時，我不會誤判成「模型很笨、不會用工具」。
+
+先確定工具是對的，再去評斷 agent 用得好不好——這跟修 bug 時「先在頁面重現、再找程式」是同一個順序。
+
+---
+
+練習 3 — ✅ 完成（接給 Claude Code，並做「關掉 MCP／開啟 MCP」對照）
+
+#### before：沒有 orderhub 工具，「哪些商品庫存低於 5?」到底怎麼讀
+
+這節記的是**這次真的重跑一遍**的兩條路，不是拿練習 1、2 的舊紀錄湊。
+兩條都不經過 MCP，答案都必須從系統外部拿到（DB 或 HTTP），不是從我的 context 拿。
+
+⚠️ **一個必須講清楚的限制**：我的 context 已經知道答案（同 session 前面呼叫過 `low_stock`）。
+所以下面量到的是**機械成本**——幾次呼叫、踩幾個坑、要先知道什麼；
+**不是盲測的探索成本**，因為我知道要往哪裡瞄。真正的盲測必須開新 session。
+但機械成本本身就足以看出差距，而且每個錯誤訊息都是真的。
+
+**路徑 A：繞過應用程式，直接下 SQL** —— 六次呼叫，兩次失敗
+
+| # | 動作 | 結果 |
+|---|---|---|
+| 1 | 讀 `src/OrderHub.Web/appsettings.json` | 拿到 `Server=localhost;Database=OrderHubTraining;Trusted_Connection=True` |
+| 2 | grep `Product.cs` | 確認欄位是 `Sku` / `Name` / `StockQuantity` / `IsActive`（不是 `SKU`、不是 `Stock`）；表名還得猜是複數 `Products` |
+| 3 | `sqlcmd -E -i <絕對路徑>` | ❌ `Sqlcmd: -E 与 -U/-P 选项互斥`（環境裡並沒有 `SQLCMDUSER`，我印出來確認過是空的） |
+| 4 | 去掉 `-E`，`-i` 仍給絕對路徑 | ❌ `Sqlcmd: 打开文件 C: 时出错（原因: 拒绝访问）`——它把 `C:` 當成檔名 |
+| 5 | `cd` 進目錄 + `-Q` 內嵌 SQL + `-o` 導檔 + `-f 65001` | ✅ exit=0 |
+| 6 | 讀輸出檔 | 才看到答案 |
+
+我下的 SQL：
+
+```sql
+SELECT Sku, Name, StockQuantity FROM Products
+WHERE StockQuantity < 5 AND IsActive = 1
+ORDER BY StockQuantity, Sku;
+```
+
+**路徑 B：打現成的網頁，從 HTML 裡挖** —— 三次呼叫，一次判斷失誤
+
+| # | 動作 | 結果 |
+|---|---|---|
+| 1 | `curl "http://localhost:5150/Products/LowStock?threshold=5"` | 5,249 bytes HTML |
+| 2 | `grep -c "<tr>"` 想數筆數 | ❌ 回 **1**。因為資料列是 `<tr class="table-danger">`，只有表頭是裸 `<tr>`——**差點誤判成「只有一筆」** |
+| 3 | `sed` 切出 `<main>` + `perl` 反解 `&#xXXXX;` | ✅ 5 筆，連「近 30 天售出」都有 |
+
+路徑 B 明顯比 A 短，但代價換了位置：
+
+- **網站必須跑著**（我這次剛好還開著 5150；不然要先 `dotnet run`，又是一輪）
+- **答案埋在 HTML 裡**：商品名稱是 `&#x6668;&#x5149;` 這種 escape，要反解才讀得懂
+- **編碼是混的**：Razor 樣板裡的靜態中文（`低庫存警示`）是原生 UTF-8，而變數輸出是 `&#x..;` escape。
+  我用 `perl -CO` 反解時，把原生那段弄成亂碼（`ä½åº«å­è­¦ç¤º`）——**同一份 HTML 兩種編碼狀態**
+- **`<tr>` 那次失誤最值得記**：我對 HTML 結構的假設是錯的，而錯法是「靜靜回一個看起來合理的數字」。
+  如果我沒有繼續往下挖，就會回報「只有 1 筆商品低於 5」——**錯得毫無徵兆**
+
+**兩條路的共同點**：答案拿得到，但都得先自己架一個管道（連上 DB／起網站），
+而且**都要自己把「低庫存」的定義重寫一次**——A 寫在 SQL 的 `WHERE`，B 寫在「`?threshold=5` 這個參數該填什麼」。
+
+#### after：有 orderhub 工具時，同一個問題
+
+問題原文：「哪些商品庫存低於 5?」
+
+**一次工具呼叫就結束**：`low_stock(threshold=5)` → 5 筆，庫存升冪。
+沒有前置條件、沒有失敗重試、沒有 HTML、沒有編碼問題。
+「低於門檻」和「只算販售中」兩條規則都在工具裡（走 `GetLowStockActiveAsync`），我不用重寫。
+
+#### 對照表：過程指標（重點在這裡）
+
+| 指標 | before A：sqlcmd 直查 DB | before B：curl 網頁挖 HTML | after：`low_stock(5)` |
+|---|---|---|---|
+| 工具呼叫次數 | **6** | **3** | **1** |
+| 失敗／誤判 | 2 次失敗 | 1 次誤判（`<tr>` 數成 1 筆） | 0 |
+| 我得先知道什麼 | 連線字串在哪個檔、表名、四個欄位拼法、sqlcmd 參數、UTF-8 要 `-f 65001` | 網址與參數名 `threshold`、HTML 結構、怎麼反解 `&#x..;` | 工具名 + `threshold` |
+| 前置條件 | SQL Server 要在跑、要有 sqlcmd | **網站要跑著** | client 自己 spawn server |
+| 「低庫存」規則 | **自己在 SQL 重寫** `StockQuantity < 5 AND IsActive = 1` | 靠頁面實作，但門檻參數要自己給對 | 工具內建，走 repository |
+| 中文 | 直接印會亂碼，要導檔 + 指定 codepage | escape 與原生 UTF-8 混在同一份 HTML | 直接可讀 |
+| 排序 | 自己寫 `ORDER BY` | 靠頁面 | 內建升冪 |
+| 資料形狀 | 表格文字，要自己切欄 | HTML，要自己剝標籤 | 已經是結構化 JSON |
+
+**多出來的一欄**：路徑 B 拿得到「近 30 天售出」（2/0/17/22/18），工具沒有——
+這跟練習 2 記過的原因一樣（頁面走 `IProductService.GetLowStockAsync` 會 join 訂單，
+我的工具走 `IProductRepository.GetLowStockActiveAsync` 只到商品層）。
+所以「工具比較好」不是全面的：**工具只吐它被設計要吐的東西**。
+
+三條路答案完全一致（也對得上練習 1 stdio 實測與練習 2 Inspector 的紀錄）：
+
+| Sku | Name | Stock |
+|---|---|---|
+| SKU-1048 | 晨光 行動電源 | 2 |
+| SKU-1005 | 極光 筆電支架 | 3 |
+| SKU-1023 | 雲峰 27吋螢幕 | 3 |
+| SKU-1032 | 曜石 機械鍵盤 | 4 |
+| SKU-1014 | 星河 USB-C 集線器 | 4 |
+
+唯一差別是**同分排序**：兩筆庫存 4 的先後不同。
+工具和網頁都是 1032 在前，我的 SQL 多加了 `, Sku` 當 tiebreak 所以 1014 在前。
+資料相同，不是 bug——但順帶驗到一件事：`ORDER BY StockQuantity` 沒有 tiebreak 時，**同分順序不保證**。
+
+#### 這次對照最值得記的一點
+
+不是「6 次 / 3 次 vs 1 次」，是對照表的**「低庫存」規則**那列：
+沒有工具時，我為了回答問題，在一句臨時 SQL 裡把「低庫存」的定義（`< 門檻` 且 `IsActive`）**又寫了一遍**。
+
+這跟練習 1 我批評範本 `LowStock` 記憶體篩選、跟地雷 3「金額別自己算」是**同一種錯**。
+差別只在：那兩次是寫進 repo 的重複，這次是寫在一次性查詢裡的重複——
+**後者更難發現，因為它不留在程式碼裡**，沒有人會 review 它，也沒有測試蓋它。
+
+所以 MCP 工具省的不只是呼叫次數，是「**每個想問這個問題的人都得重新猜一次規則**」。
+
+#### 又一次「不熱插拔」——這次是反方向
+
+前面記過兩次「加了 server 要重啟才生效」。這次是同一條規則的反面：
+**把 `.mcp.json` 改名成 `.mcp.json.off`，正在跑的 session 依然叫得動 `low_stock`。**
+
+（時間點我無法完全確定：我發現檔案已經是 `.off` 時，成功那次呼叫已經發生了。
+但結論與已知規則一致——連線在 CLI 啟動時建立，之後動檔案不影響它。）
+
+**所以要做乾淨的 before，改名不夠，必須開新 session。** 這也是為什麼上面那條 before 只能算機械成本。
+
+還有一個新證據：**我手動殺掉的 MCP server，client 會自己再 spawn 一個。**
+
+| 時間點 | `dotnet run` PID | `OrderHub.Mcp.exe` PID |
+|---|---|---|
+| 我殺之前 | 416 | 18272 |
+| 殺掉後、`low_stock` 成功時 | 22728 | 10048 |
+
+跟前面那條「client 死掉、server 不一定死」正好配成一對：**server 死掉，client 會補一個。**
+兩邊的生命週期都不是直覺以為的那樣，所以「現在在講話的是哪個實例」要用 PID 確認，不能靠推測。
+
+#### 附帶踩到的：MSB3021 又來了一次，這次鎖檔的是 `.mcp.json` spawn 的 server
+
+前面「停掉 Inspector 沒殺掉子程序」那節記過一次。這次一模一樣的錯誤訊息再出現：
+
+```
+error MSB3021: 無法將 OrderHub.Core.dll 複製到 bin\Debug\net10.0\...
+The process cannot access the file ... because it is being used by another process.
+```
+
+差別是這次鎖檔的不是 Inspector 的殘影，而是 **`.mcp.json` 裡 `dotnet run` 起來的那個 server 本體**——
+它是 Claude Code 的子程序，會活整個 session，所以**只要 session 開著就不能 build `OrderHub.Mcp`**。
+
+| PID | 程序 |
+|---|---|
+| 416 | `dotnet run --project src/OrderHub.Mcp` |
+| 18272 | **`OrderHub.Mcp.exe`** ← 鎖著 `bin\Debug\net10.0\OrderHub.Core.dll` |
+
+殺掉兩支後 build 立刻成功（3.72 秒）。
+但代價是**工具當場斷線**，而且如上所述，client 稍後又 spawn 了一個新的（22728 / 10048）。
+
+這是練習 1 標的那個 `dotnet run` 風險**換一種方式引爆**：
+地雷 1（建置訊息汙染 stdout）沒爆，但同一個 `dotnet run` 造成了 build 鎖檔。
+真要避開，`.mcp.json` 應該指向已編好的 exe／dll，而不是 `dotnet run`——
+這樣 server 跟 build 就不會共用同一個輸出目錄。
+
+#### 驗證方式
+
+- ✅ orderhub server 連上、工具可用 —— 證據是**真的呼叫成功**（`low_stock(5)` 回 5 筆），
+  比 `/mcp` 畫面列出來更強。（`/mcp` 的 UI 我沒看，那要互動視窗；三個工具「列得出來」在練習 2 已用 Inspector 驗過。）
+- ✅ 對照實驗完成且記錄（before 兩條路徑實測 + after 一條，過程指標見上表）
+- ✅ `.mcp.json` 進 git，一個獨立 commit（`3f5e34f`）
 
 ---
 

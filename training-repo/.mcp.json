@@ -2,7 +2,11 @@
   "mcpServers": {
     "orderhub": {
       "command": "dotnet",
-      "args": ["run", "--project", "src/OrderHub.Mcp"]
+      "args": [
+        "run",
+        "--project",
+        "src/OrderHub.Mcp"
+      ]
     }
   }
 }
