@@ -502,6 +502,112 @@ The process cannot access the file ... because it is being used by another proce
 
 ---
 
+練習 4 — ✅ 完成（第一個會改資料的工具：`cancel_order`）
+
+前三個工具全是唯讀的，agent 用錯頂多答錯。這個會**真的改資料庫**。
+
+工具本體只有 4 行——狀態檢查與庫存回補全在 `OrderService.CancelOrderAsync`（`OrderService.cs:92`），
+工具只轉接，一行規則都不重寫。這跟練習 1 把 `LowStock` 改成呼叫現成 repository 是同一條原則。
+
+#### 標註的預設值：範本裡有兩個是 no-op
+
+範本寫 `[McpServerTool(Destructive = true, Idempotent = false)]`。
+照抄之前我去翻了 SDK 2.0.0 的 `ModelContextProtocol.Core.xml`，查每個屬性的**實際預設值**：
+
+| 屬性 | 預設 | 標了會怎樣 |
+|---|---|---|
+| `Destructive` | **`true`** | 範本這個標註**等於沒標**——預設就是 true |
+| `Idempotent` | `false` | 同上，也是預設值 |
+| `ReadOnly` | `false` | ⚠️ **這個才有用**：唯讀工具不標＝向 client 宣告「我可能會改東西」 |
+| `OpenWorld` | `true` | 預設宣告「會碰不可預測的外部實體」（我們四個都只打自家 DB，其實不符） |
+
+所以這題真正改變 client 行為的**不是**範本那兩個標註，而是回頭補在三個唯讀工具上的 `ReadOnly = true`。
+`OpenWorld` 我這次沒動——語意上四個工具都該是 `false`，但它不影響確認時機，留著當已知落差。
+
+教訓跟練習 1「指令跑完不代表結果正確」同型：**照抄範本 ≠ 知道自己標了什麼。**
+兩個 no-op 標註不會出錯，但如果我以為「有標就有效」，那個誤解會跟著我到下一個 server。
+
+#### `tools/list` 實際吐出來的 annotations
+
+| 工具 | readOnlyHint | destructiveHint | idempotentHint |
+|---|---|---|---|
+| `cancel_order` | (未輸出) | **True** | **False** |
+| `customer_orders` | **True** | (未輸出) | (未輸出) |
+| `get_order` | **True** | (未輸出) | (未輸出) |
+| `low_stock` | **True** | (未輸出) | (未輸出) |
+
+值得記：**等於預設值的欄位 SDK 根本不輸出**。所以「線上看不到 `readOnlyHint: false`」不代表沒宣告，
+而是「沒宣告＝預設 false」——client 看到的結果一樣。
+
+#### 四種情況的實測回應
+
+```
+cancel_order(1) 第一次   -> 訂單 1 已取消，庫存已回補
+cancel_order(1) 第二次   -> 取消失敗：狀態為 Cancelled 的訂單不可取消
+cancel_order(2) 已出貨   -> 取消失敗：狀態為 Shipped 的訂單不可取消
+cancel_order(999999)    -> 取消失敗：找不到指定的訂單
+```
+
+四則的 `isError` **都是未設定**——連失敗的三則也是。這是刻意的：
+「這筆不能取消」是**正常的業務結果**，不是協定層錯誤。agent 收到這句話能向使用者解釋並停手；
+收到 stack trace 只會瞎猜重試。stdout 7 行全部合法 JSON-RPC，stderr 零 exception。
+
+#### 庫存回補：SQL 與頁面兩邊對帳
+
+訂單 1（Pending，3 個品項）取消前後：
+
+| SKU | 訂購量 | 取消前庫存 | 取消後庫存 | 頁面 `/Products` |
+|---|---|---|---|---|
+| SKU-1009 | 1 | 42 | **43** | 43 |
+| SKU-1032 | 1 | 4 | **5** | 5 |
+| SKU-1044 | 2 | 98 | **100** | 100 |
+
+訂單狀態 `0 → 3`（Cancelled）。訂單 2（Shipped）三個品項庫存 86/46/18 **完全沒動**——
+證明失敗的那次呼叫真的沒有副作用，不是「報錯但已經改了一半」。
+
+**一個不用自己驗自己的交叉驗證**：SKU-1032 原本庫存 4，是練習 3 那份 `low_stock(5)` 名單的成員。
+回補成 5 之後 `5 < 5` 不成立，它**應該掉出名單**。取消後再打一次 `low_stock(5)`：
+
+```
+取消前 5 筆：SKU-1048(2)、SKU-1005(3)、SKU-1023(3)、SKU-1032(4)、SKU-1014(4)
+取消後 4 筆：SKU-1048(2)、SKU-1023(3)、SKU-1005(3)、SKU-1014(4)
+```
+
+一個唯讀工具的輸出，因為另一個工具寫了資料而改變——**兩個工具走同一份真實狀態**，
+而不是各自快取一份。這比單看 `cancel_order` 回傳的成功訊息有力。
+
+#### 又踩一個編碼坑：PowerShell 5.1 讀 .ps1 當 ANSI
+
+測試腳本第一版我在 label 裡寫中文，執行直接 parser error：
+
+```
++ @{ Id = 4; Label = 'cancel_order(1)  第二�?;  Args = @{ id = 1 } },
+字符串缺少终止符
+```
+
+原因：**檔案存成 UTF-8 無 BOM，PowerShell 5.1 會用系統 ANSI（GBK）去讀**，
+中文字被拆爛，連帶把單引號吃掉。改成整份腳本純 ASCII 就好（server 回來的中文不受影響，
+那是 runtime 的 stdout 編碼，我已經明確設 UTF-8）。
+
+跟練習 1 那兩個坑一樣，**這也是我的測試工具壞了，不是 server 壞了**。第三次了。
+
+#### 我做不到、要你自己做的一項
+
+驗收清單第 2 項「對 agent 說『幫我取消訂單 X』，觀察權限確認提示」——
+工具清單是 CLI 啟動時抓的，**不熱插拔**（這條規則本檔已出現第三次），
+所以 `cancel_order` 要開新 session 才會進到我的工具清單；我也無法對自己觸發權限提示。
+
+#### 驗證方式
+
+- ✅ `dotnet build src/OrderHub.Mcp` 0 errors / 0 warnings；`dotnet test` **35 綠**
+- ✅ annotations 如上表（三個唯讀 `readOnlyHint: true`，`cancel_order` destructive/idempotent 如標）
+- ✅ 取消一筆待處理訂單成功，庫存回補：SQL 與 `/Products` 頁面兩邊數字一致
+- ✅ 重複取消／已出貨／查無訂單都回清楚中文訊息，非 exception dump，且失敗無副作用
+- ⬜ **（待你做）** 新 session 說「幫我取消訂單 X」，確認按允許前資料沒被動到
+- ⬜ （選做）Inspector UI 看 annotations——文字證據已用 `tools/list` 取得
+
+---
+
 ## 附錄：值得留下的對話片段
 
 （貼 1–2 段最有代表性的 prompt 與回應**摘要**——不用貼全文，重點是「我怎麼問」和「它怎麼答」。）
