@@ -608,6 +608,103 @@ cancel_order(999999)    -> 取消失敗：找不到指定的訂單
 
 ---
 
+練習 5 — ✅ 完成（Resource 與 Prompt：MCP 不只有 tools）
+
+新增兩個檔案、Program.cs 接兩行：
+
+```csharp
+    .WithTools<OrderHubTools>()
+    .WithResources<OrderHubResources>()   // orderhub://discount-rules
+    .WithPrompts<OrderHubPrompts>();      // low_stock_report
+```
+
+`ChatMessage` 來自 `Microsoft.Extensions.AI`，是 `ModelContextProtocol` 2.0.0 帶進來的**遞移依賴**，
+`.csproj` 一個字都不用改。這點先確認再動手，因為 CLAUDE.md 寫著「不要未經同意就加 NuGet 套件」——
+範本裡多一個 `using` 不代表要多一個 `PackageReference`。
+
+#### 三個原語的分工
+
+| 原語 | 是什麼 | 誰決定何時用 | 這次的例子 |
+|---|---|---|---|
+| Tool | **動作**（查、算、改） | agent 自己決定呼叫 | `low_stock`、`cancel_order` |
+| Resource | **資料**（讀進 context） | **client／使用者**（`@` 選取） | 會員折扣規則 |
+| Prompt | **範本**（替使用者說話） | 使用者（slash command） | `low_stock_report` |
+
+「什麼都做成 tool」是最常見的 MCP 設計臭味。折扣規則沒有參數、不打 DB，
+它不是動作而是**背景知識**——做成 tool 就是要 agent 猜「我該不該查一下折扣規則」，
+做成 resource 才是「使用者知道這題要用，主動掛上去」。
+
+#### 不靠 Inspector 的文字證據
+
+`/mcp` 看得到清單但看不到 payload，所以我直接餵 6 筆 JSON-RPC 到 stdio（initialize →
+resources/list → resources/read → prompts/list → prompts/get），實際回應：
+
+```
+capabilities: {"logging":{},"prompts":{"listChanged":true},
+               "resources":{"listChanged":true},"tools":{"listChanged":true}}
+resources/list  -> 會員折扣規則 / orderhub://discount-rules / text/markdown
+resources/read  -> "# OrderHub 會員折扣規則\n- Standard：不打折\n- Silver：95 折\n- Gold：9 折…"
+prompts/list    -> low_stock_report，arguments: threshold（required: false）
+prompts/get(threshold=5) -> "請用 low_stock 工具（threshold=5）查出低庫存商品…"
+```
+
+最後一則是重點：**參數真的被代進範本了**（`threshold=5`，不是預設的 10）。
+prompt 展開後的內容是「叫 agent 去用 low_stock」——prompt 引導 tool，兩個原語在這裡合體。
+
+capabilities 也從只有 `tools` 變成三個都在。這是 server 對 client 的自我宣告，
+少接一行 `WithResources`，client 就永遠不會來問 `resources/list`。
+
+#### 5c 第 3 點：為什麼不讓 agent 自己去讀程式碼？
+
+**折扣規則用 Resource 給 vs. 讓 agent 自己讀 `OrderService.cs`：**
+自己讀要花好幾輪工具呼叫（grep → 讀檔 → 推論 `0.10m` 是「折掉 10%」還是「收 10%」），
+而且每個人、每個 session 都要重跑一次，答案還可能不一樣。Resource 是**一次寫好、全隊同一份**，
+還附上「折抵一次」、「UnitPriceSnapshot 是原價」這種**程式碼裡看不出來的意圖**。
+
+**Prompt 範本放 server vs. 每個人自己打一段話：**
+自己打，十個人有十種問法，報表欄位每次都不一樣；規則改版時要通知十個人各自改自己的筆記。
+放 server 就是**進版控、code review、改一個地方全隊生效**——跟前面幾個練習「單一真實來源」是同一堂課。
+
+#### 地雷確認：我自己就製造了兩份真相
+
+文件的地雷區點名這件事，我照範本寫死了折扣文字，所以動手前先去對帳
+`OrderService.GetDiscountRate`（`OrderService.cs:119`）：`Gold => 0.10m`、`Silver => 0.05m`、
+其他 `0m`——和 resource 寫的 9 折／95 折／不打折**目前一致**。
+
+但「目前一致」就是問題本身：規則改版時要改兩個地方，而且沒有任何測試會抓到它們不一致。
+我在檔案的 doc comment 裡把這件事寫明了。想真正解掉得讓 resource 動態組內容
+（注入 `IOrderService`，把三個 tier 的 `GetDiscountRate` 跑出來組成 markdown），
+這樣就退回單一真實來源——這次沒做，留成已知落差，和練習 4 的 `OpenWorld` 同一類。
+
+#### 又一個工具坑：跑著的 server 會鎖住 bin
+
+第一次 `dotnet build src/OrderHub.Mcp` 直接失敗：
+
+```
+error MSB3027: 无法将 OrderHub.Infrastructure.dll 复制到 bin\Debug\net10.0\…
+              文件由 OrderHub.Mcp (26328) 锁定
+```
+
+Claude Code 自己拉起來的 MCP server 正抓著 `bin\Debug\net10.0` 裡的 DLL。
+**要改 MCP server 的程式碼，得先讓 client 放掉那個行程**（停掉行程或 `/mcp disable`），
+build 完再 reconnect。這是第四個「我的工具鏈壞了，不是 server 壞了」——
+前三個是編碼問題，這個是**開發中的 server 同時是正在被使用的 server**造成的自我打結。
+
+#### 驗證方式
+
+- ✅ `dotnet build src/OrderHub.Mcp` 0 errors / 0 warnings；`dotnet test` **35 綠**（未受影響）
+- ✅ JSON-RPC 直測：`resources/list`、`resources/read`、`prompts/list`、`prompts/get(threshold=5)` 全部正確回應（payload 如上）
+- ✅ server capabilities 由 `tools` 擴為 `tools + resources + prompts`
+- ✅ resource 文字與 `OrderService.GetDiscountRate` 對帳一致（並記下這是兩份真相）
+- ⬜ **（待你做）** `/mcp reconnect` 後用 `@` 選 `orderhub://discount-rules`，問「Gold 會員買 1000 元應付多少」（預期 900），確認它不讀程式碼就答對
+- ⬜ **（待你做）** `/mcp__orderhub__low_stock_report` 一鍵產出採購建議表，觀察它展開範本後自動呼叫 `low_stock`
+- ⬜ （選做）Inspector UI 的 Resources／Prompts 分頁——文字證據已用 JSON-RPC 取得
+
+這兩項「待你做」的理由和練習 4 一樣：resource 的 `@` 選取和 prompt 的 slash command
+都是**使用者介面動作**，我無法替自己觸發。
+
+---
+
 ## 附錄：值得留下的對話片段
 
 （貼 1–2 段最有代表性的 prompt 與回應**摘要**——不用貼全文，重點是「我怎麼問」和「它怎麼答」。）
