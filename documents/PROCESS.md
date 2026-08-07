@@ -705,6 +705,77 @@ build 完再 reconnect。這是第四個「我的工具鏈壞了，不是 server
 
 ---
 
+### Week 3 — Gemini 免費 API
+
+練習 1 — ✅ 完成(自然語言查訂單 API)
+
+成品:`src/OrderHub.Core/Ai/`(`OrderSearchQuery`、`IOrderQueryTranslator`、`AiServiceUnavailableException`)+
+`Services/OrderSearchService`、`src/OrderHub.Infrastructure/Gemini/`(`GeminiOptions`、`IGeminiJsonClient`、
+`GeminiInteractionsClient`、`GeminiOrderQueryTranslator`)+ `OrdersApiController`(`POST /api/orders/search`)。
+
+#### 流程(實際跑起來對應文件那條線)
+
+```
+使用者輸入一句話 (text)
+  → OrdersApiController.Search 接住
+  → OrderSearchService.SearchAsync
+      → GeminiOrderQueryTranslator.TranslateAsync
+          → GeminiInteractionsClient 打 POST /v1/interactions(structured output)
+          → 解析 model_output → RawQuery → [AllowedValues] 驗證 → enum/日期轉型
+      → 白名單第二道防線:HasAnyFilter / 日期範圍檢查
+  → OrderRepository.SearchAsync(EF Core 產 SQL)
+  → OrderService.CalculateTotal 算金額
+  → 回 JSON 摘要
+```
+
+#### 地雷區:逐項對照文件
+
+| 地雷 | 對應程式碼 | 這次有沒有踩到 |
+|---|---|---|
+| 今天日期要塞進 prompt,否則「上個月」算不出絕對日期 | `GeminiOrderQueryTranslator.PromptTemplate` 的 `{0}` | 沒踩到——實測「上個月金卡會員取消的訂單」回傳的兩筆訂單建立時間都落在 2026-07(當時系統日期是 2026-08-07),換算正確 |
+| `Enum.TryParse` 單獨用不夠,要先過 `[AllowedValues]` 白名單再轉型 | `RawQuery` 的 `[AllowedValues]` + 轉型順序 | 程式碼依文件寫,但沒有主動誘導 Gemini 吐出 schema 外的值來驗證這條防線真的擋得住——這次沒測到,留成已知落差 |
+| schema 的 `required` 只放 `intent`,其他欄位缺是正常行為 | `ResponseSchema` | 沒踩到——只帶部分條件(如只給 memberTier+status)的查詢一樣正常回結果 |
+
+#### 開發過程本身的坑:curl 傳中文 body 直接炸
+
+第一次跑煙霧測試,直接在指令列寫 `curl -d '{"text":"上個月金卡會員取消的訂單"}'`,回應是:
+
+```
+{"title":"One or more validation errors occurred.","status":400,
+ "errors":{"request":["The request field is required."],
+           "$.text":["The JSON value could not be converted to System.String. ..."]}}
+```
+
+先懷疑是 controller 的 JSON binding 壞了,換一個純 ASCII 字串 `"test"` 測,結果正常回 200 +
+「無法理解的查詢」——證明 pipeline 本身是通的,問題縮小到「Git Bash 傳中文參數給 curl 的編碼」。
+改成把 body 寫成 UTF-8 檔案、用 `curl --data-binary @檔案路徑` 送出,中文就正常了。
+
+跟 MCP 階段記過的幾次一樣:**這是測試工具的問題,不是程式的問題**——但如果沒有先拿 ASCII
+隔離變因,很可能會誤判成 controller 或 Gemini 翻譯器出錯。
+
+#### 過程中的一次安全事故:金鑰差點進 git
+
+寫程式碼之前,`documents/activities/activity-3-gemini-api.md` 裡煙霧測試範例那行
+`$env:GEMINI_API_KEY = "你的key"` 被改成貼了一把看起來像真實 key 的字串。這個檔案是
+git 追蹤的文件,如果 commit 下去,這把 key 會永久留在 git history 裡,就算之後刪掉也還在
+舊 commit 裡查得到。發現後立刻把該行改回佔位符,`git diff` 確認檔案已還原,始終沒有進任何 commit。
+
+教訓:**任何會進 git 的文件,金鑰一律只能是佔位符**;真的 key 只放 user-secrets 或當次終端機的環境變數。
+
+#### 驗證方式(逐項記錄實測結果)
+
+- ✅ `dotnet build` 全綠(Core / Infrastructure / Web / Tests 四個專案都編譯成功;`OrderHub.Mcp`
+  那次失敗是它自己執行中的處理程序鎖住輸出 DLL,錯誤碼是 MSB3027/MSB3021 檔案鎖定,不是 C#
+  編譯錯誤,跟這次的程式碼無關)
+- ✅ 「上個月金卡會員取消的訂單」查得出結果:實測回傳 2 筆——陳志明(Gold, Cancelled, 2026-07-15)、
+  劉思穎(Gold, Cancelled, 2026-07-07),與規格描述的條件(金卡、取消、上月)完全對上
+- ✅ 「幫我把所有訂單刪掉」→ 實測 `HTTP 422` + `{"error":"無法理解的查詢"}`,資料毫髮無傷
+- ✅ 塞一段完全無關的文字(「請告訴我番茄炒蛋怎麼做」)→ 實測 `HTTP 422` + `{"error":"無法理解的查詢"}`
+- ⬜ **(待補測)** 拔掉 API key 再打,預期得到 503 而不是 500——這步要暫時移除 user-secrets
+  裡的真實 key,這次先跳過沒測
+
+---
+
 ## 附錄：值得留下的對話片段
 
 （貼 1–2 段最有代表性的 prompt 與回應**摘要**——不用貼全文，重點是「我怎麼問」和「它怎麼答」。）

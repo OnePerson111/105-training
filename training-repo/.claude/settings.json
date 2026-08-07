@@ -6,9 +6,13 @@
       "Bash(git reset --hard *)",
       "Read(**/appsettings.Production.json)",
       "Read(**/*.pfx)",
-      "Edit(src/OrderHub.Infrastructure/Migrations/**)"
+      "Edit(src/OrderHub.Infrastructure/Migrations/**)",
+      "Read(**/UserSecrets/**)"
     ],
-    "ask": ["Bash(dotnet ef database drop *)", "Bash(git push *)"],
+    "ask": [
+      "Bash(dotnet ef database drop *)",
+      "Bash(git push *)"
+    ],
     "allow": [
       "Bash(dotnet build *)",
       "Bash(dotnet test *)",
@@ -19,7 +23,9 @@
       "Bash(git add *)",
       "Bash(git commit *)"
     ],
-    "additionalDirectories": ["../documents"]
+    "additionalDirectories": [
+      "../documents"
+    ]
   },
   "hooks": {
     "PreToolUse": [
